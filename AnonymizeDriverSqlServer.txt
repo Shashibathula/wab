@@ -1,0 +1,209 @@
+import urllib
+import pyodbc
+import pandas as pd
+import sqlalchemy as sqlalchemy
+from faker import Factory
+import collections
+import argparse
+import time
+
+pd.options.mode.chained_assignment = None
+
+arg = argparse.ArgumentParser(description="Data Masking")
+arg.add_argument("--config_file", required=True, help="Input Path to Config File")
+arg.add_argument("--file_name", required=True, help="File Name to be processed")
+arg.add_argument("--source_name", required=True, help="Source Name to be processed")
+arg.add_argument("--layer_name", required=True, help="Processing Layer Name")
+
+args = arg.parse_args()
+configPath = args.config_file
+file_name = args.file_name.lower()
+layer_name = args.layer_name.lower()
+src_name = args.source_name.lower()
+
+print(f"********************File name is {file_name}********************")
+print(f"********************Layer name is {layer_name}********************")
+print(f"********************Source name is {src_name}********************")
+
+print(f"********************Configuration file path is {configPath}********************")
+config_df = pd.read_csv(configPath, sep=';')
+config_df = config_df[(config_df.ARCHITECTURE_LAYER == layer_name.strip().upper()) &
+                      (config_df.FILE_NAME == file_name.strip().upper()) &
+                      (config_df.SOURCE_NAME == src_name.strip().upper())]
+cols = ['ARCHITECTURE_LAYER', 'ACTION', 'KEY']
+config_df['KEYS'] = config_df[cols].apply(lambda row: '_'.join(row.values.astype(str)), axis=1)
+
+config_df = config_df[['KEYS', 'VALUE']]
+config_df['KEYS'] = config_df['KEYS'].str.lower()
+config_rdd = dict(zip(config_df.KEYS, config_df.VALUE))
+
+print(f"********************Configuration dictionary is {config_rdd}********************")
+
+src_cols_list = [elem.strip() for elem in config_rdd[layer_name.lower() + '_source_col_names'].split("||")]
+print(f"********************Columns to be masked are {src_cols_list}********************")
+faker_cols_list = ["collections.defaultdict(" + elem.strip() + ")" for elem in
+                   config_rdd[layer_name.lower() + '_source_faker_names'].split("||")]
+
+faker = Factory.create()
+source_server = config_rdd[layer_name + "_source_source_server"]
+
+
+###########Custom phone format#################
+def customised_phone_number():
+    return faker.numerify('###-###-####')
+
+
+# server = 'USHYDVEDKUM1'
+print(f"********************Source server is {source_server}********************")
+source_database = config_rdd[layer_name + "_source_source_db"]
+print(f"********************Source database is {source_database}********************")
+# database = 'user_db'
+source_table = config_rdd[layer_name + "_source_source_table"]
+print(f"********************Source table is {source_table}********************")
+
+source_username = config_rdd[layer_name + "_source_source_username"]
+source_username = ''
+source_password = config_rdd[layer_name + "_source_source_password"]
+source_password = ''
+
+filter_condition = config_rdd[layer_name + "_source_source_filter"]
+print(f"********************Filter condition to be applied: {filter_condition}********************")
+
+target_server = config_rdd[layer_name + "_source_target_server"]
+print(f"********************Target server is {target_server}********************")
+target_database = config_rdd[layer_name + "_source_target_db"]
+print(f"********************Target database is {target_database}********************")
+target_table = config_rdd[layer_name + "_source_target_table"]
+print(f"********************Target table is {target_table}********************")
+target_username = config_rdd[layer_name + "_source_target_username"]
+target_username = ''
+target_password = config_rdd[layer_name + "_source_target_password"]
+target_password = ''
+
+print(f"********************Connecting to the source database....********************")
+source_cnxn = pyodbc.connect(
+    'DRIVER={SQL Server};SERVER=' + source_server + ';DATABASE=' + source_database + ';UID=' + source_username + ';PWD=' + source_password)
+source_cursor = source_cnxn.cursor()
+
+# query = "SELECT src_name, src_email, src_ssn, src_phone_number, src_type_of_care, src_insurance_type, src_company FROM " + source_table +";"
+query = "SELECT * FROM " + source_table + " WHERE " + filter_condition + ";"
+df = pd.read_sql(query, source_cnxn)
+print(f"********************Stored input data in Pandas dataframe********************")
+
+query_to_retrieve_column_names = \
+    "select schema_name(tab.schema_id) as schema_name,\
+    tab.name as table_name, \
+    col.column_id,\
+    col.name as column_name, \
+    t.name as data_type,    \
+    col.max_length, \
+    col.precision \
+    from sys.tables as tab \
+    inner join sys.columns as col \
+    on tab.object_id = col.object_id and tab.name = " + "'" + source_table + "'" + \
+    " left join sys.types as t \
+    on col.user_type_id = t.user_type_id \
+    order by schema_name, \
+    table_name,  \
+    column_id;"
+
+print(f"********************Executing the below query to retrieve column names********************")
+print(query_to_retrieve_column_names)
+
+column_df = pd.read_sql(query_to_retrieve_column_names, source_cnxn)
+
+column_name_type_lengths_df = column_df[['column_name', 'data_type', 'max_length']]
+
+column_list = column_df['column_name'].tolist()
+
+print(f"********************Below are the columns in the source table ********************")
+print(column_list)
+
+# target_cnxn = pyodbc.connect(
+#     'DRIVER={SQL Server};SERVER=' + target_server + ';DATABASE=' + target_database + ';UID=' + target_username + ';PWD=' + target_password)
+# target_cursor = target_cnxn.cursor()
+
+#############
+import sqlalchemy as sa
+
+# params = 'DRIVER={ODBC Driver 17 for SQL Server};SERVER='+target_server + ';DATABASE=' + target_database + ';UID=' + target_username + ';PWD=' + target_password
+# db_params = urllib.parse.quote_plus(params)
+# engine = sa.create_engine("mssql+pyodbc:///?odbc_connect={}".format(db_params),fast_executemany=True)
+target_connection_string = 'mssql+pyodbc://' + target_server + '/' + target_database + '?driver=ODBC+Driver+17+for+SQL+Server?Trusted_Connection=yes'
+engine = sa.create_engine(target_connection_string, fast_executemany = True )
+# engine = sa.create_engine('mssql+pyodbc://USHYDVEDKUM1/user_db_target?driver=ODBC+Driver+17+for+SQL+Server?Trusted_Connection=yes', fast_executemany = True)
+target_con = engine.connect()
+
+############
+# faker_cols_list = ['collections.defaultdict(faker.email)', 'collections.defaultdict(faker.ssn)', 'collections.defaultdict(faker.phone_number)', 'collections.defaultdict(faker.company)']
+dict4 = dict(zip(src_cols_list, faker_cols_list))
+#print(dict4)
+
+dict5 = {key: eval(value) for key, value in dict4.items()}
+#print(dict5)
+
+
+# Logic to find max length per attribute
+# Need to filter such that column_name == elem and retrieve max_length
+def retrieve_max_length_of_column(col):
+    length_in_systypes = \
+    column_name_type_lengths_df.loc[column_name_type_lengths_df['column_name'] == col]['max_length'].tolist()[0]
+    data_type_of_column = \
+    column_name_type_lengths_df.loc[column_name_type_lengths_df['column_name'] == col]['data_type'].tolist()[0]
+    if data_type_of_column == 'nvarchar':
+        length_to_use = int(length_in_systypes / 2)
+    else:
+        length_to_use = int(length_in_systypes)
+    return length_to_use, data_type_of_column
+
+print(f"********************Generating Pandas dataframe with masked data ********************")
+start_mask_data = time.process_time()
+
+for elem in dict5.keys():
+    max_length_allowed, data_type_of_elem = retrieve_max_length_of_column(elem)
+    if data_type_of_elem in ['char', 'varchar', 'text', 'nchar', 'nvarchar', 'ntext']:
+        df[elem] = df.apply(
+            # lambda row: print('$$$$$$$$$$',(row['country'])), axis = 1)
+            lambda row: (dict5[elem][row[elem]][:max_length_allowed]), axis=1)
+        # print("$$$$$$$$$$$$$$$",row['country'])
+        # ctry =  row['country']
+    elif data_type_of_elem in ['bigint', 'numeric', 'bit', 'smallint', 'decimal', 'smallmoney', 'int', 'tinyint',
+                               'money', 'float', 'real']:
+        df[elem] = df.apply(
+            lambda row: int(str(dict5[elem][row[elem]][:max_length_allowed])), axis=1)
+
+print(f"********************Done with generating Pandas dataframe with masked data ********************")
+print(f"********************Time taken to generate masked data is {time.process_time() - start_mask_data} seconds ********************")
+
+# creating column list for insertion
+cols = ",".join([str(i) for i in column_list])
+
+print(f"********************Inserting the target table with masked data ********************")
+
+# start = time.process_time()
+
+# for index, row in df.iterrows():
+#     # sql = "INSERT INTO " + target_table + "(" + cols + ") VALUES (?,?,?,?,?,?,? )"
+#     sql = "INSERT INTO " + target_table + "(" + cols + ") VALUES (" + "?," * (len(row) - 1) + "?)"
+#     # print(sql)
+#     # target_cursor.execute("INSERT INTO " + target_table + "(src_name,src_email,src_ssn,src_phone_number,src_type_of_care,src_insurance_type , src_company) values(?,?,?,?,?,?,?)", row.src_name,
+#     #                row.src_email, row.src_ssn, row.src_phone_number, row.src_type_of_care, row.src_insurance_type, row.src_company)
+#     target_cursor.execute(sql, tuple(row))
+#
+# target_cnxn.commit()
+# target_cursor.close()
+
+####################
+
+start = time.process_time()
+
+df.to_sql(target_table, target_con, index=False, if_exists="replace", chunksize=10000)
+print(f"********************Time taken to insert masked records is {time.process_time() - start} seconds ********************")
+target_con.close()
+
+####################
+
+source_cnxn.commit()
+source_cursor.close()
+
+print(f"********************Done with inserting the target table with masked data ********************")
